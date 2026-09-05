@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Quick Selection Toolbar
 // @namespace    http://tampermonkey.net/
-// @version      2.3
-// @description  Миниатюрные иконки «Копировать», «Поиск в Google» и «Закрыть» с позиционированием строго у курсора мыши при любом направлении выделения
+// @version      2.4
+// @description  Миниатюрные иконки «Копировать», «Поиск в Google» и «Закрыть» с точным определением строк на любых сайтах со сложной стилизацией
 // @author       Antigravity
 // @match        *://*/*
 // @grant        GM_setClipboard
@@ -12,10 +12,10 @@
 (function () {
     'use strict';
 
-    // Создаем изолированный контейнер через Shadow DOM
+    // Создаем изолированный контейнер через Shadow DOM с максимальным z-index
     const host = document.createElement('div');
     host.id = 'tm-selection-toolbar-host';
-    host.style.all = 'initial';
+    host.style.cssText = 'all: initial !important; position: absolute !important; top: 0 !important; left: 0 !important; z-index: 2147483647 !important; pointer-events: none !important; width: 0 !important; height: 0 !important;';
     document.documentElement.appendChild(host);
 
     const shadow = host.attachShadow({ mode: 'open' });
@@ -24,16 +24,17 @@
     const style = document.createElement('style');
     style.textContent = `
         :host {
-            all: initial;
-            z-index: 2147483647;
-            position: absolute;
-            top: 0;
-            left: 0;
-            pointer-events: none;
+            all: initial !important;
+            z-index: 2147483647 !important;
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            pointer-events: none !important;
         }
 
         .toolbar {
             position: absolute;
+            z-index: 2147483647;
             display: inline-flex;
             align-items: center;
             gap: 2px;
@@ -238,7 +239,38 @@
         toolbar.classList.remove('visible');
     }
 
-    // Определение выделения, направления и строки курсора
+    // Группировка прямоугольников в реальные физические строки по вертикальному перекрытию
+    function groupRectsIntoLines(rects) {
+        if (rects.length <= 1) return rects.map(r => ({ top: r.top, bottom: r.bottom, left: r.left, right: r.right }));
+
+        const lines = [];
+        for (const r of rects) {
+            let placed = false;
+            for (const line of lines) {
+                const overlap = Math.min(r.bottom, line.bottom) - Math.max(r.top, line.top);
+                const minH = Math.min(r.height || (r.bottom - r.top), line.bottom - line.top);
+
+                if (overlap > minH * 0.35) {
+                    line.top = Math.min(line.top, r.top);
+                    line.bottom = Math.max(line.bottom, r.bottom);
+                    line.left = Math.min(line.left, r.left);
+                    line.right = Math.max(line.right, r.right);
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) {
+                lines.push({
+                    top: r.top,
+                    bottom: r.bottom,
+                    left: r.left,
+                    right: r.right
+                });
+            }
+        }
+        return lines.sort((a, b) => a.top - b.top);
+    }
+
     function getSelectionInfo(mousePos) {
         const selection = window.getSelection();
         let text = selection ? selection.toString().trim() : '';
@@ -255,44 +287,37 @@
 
         if (!text) return null;
 
-        let rects = [];
+        let rawRects = [];
         let isMultiLine = false;
 
         if (isInput) {
             const r = activeEl.getBoundingClientRect();
-            rects = [r];
+            rawRects = [r];
             isMultiLine = text.includes('\n');
         } else if (selection && selection.rangeCount > 0) {
             const range = selection.getRangeAt(0);
-            const rawRects = Array.from(range.getClientRects()).filter(r => r.width > 0 && r.height > 0);
-            if (rawRects.length === 0) {
+            const filtered = Array.from(range.getClientRects()).filter(r => r.width > 0 && r.height > 0);
+            if (filtered.length === 0) {
                 const bounding = range.getBoundingClientRect();
                 if (bounding.width > 0 && bounding.height > 0) {
-                    rawRects.push(bounding);
+                    filtered.push(bounding);
                 }
             }
-            rects = rawRects;
+            rawRects = filtered;
 
-            if (rects.length > 1) {
-                const firstTop = rects[0].top;
-                const lastTop = rects[rects.length - 1].top;
-                if (Math.abs(lastTop - firstTop) > 6) {
-                    isMultiLine = true;
-                }
-            }
+            const distinctLines = groupRectsIntoLines(rawRects);
+            isMultiLine = distinctLines.length > 1;
         }
 
-        if (rects.length === 0) return null;
+        if (rawRects.length === 0) return null;
 
-        // Вычисляем, где именно находился курсор (начало или конец выделения)
-        let cursorRect = rects[rects.length - 1];
+        let cursorRect = rawRects[rawRects.length - 1];
         let cursorX = cursorRect.right;
         let isCursorAtTop = false;
 
         if (mousePos) {
-            // Ищем строку, ближайшую к координате мыши Y
             let minDist = Infinity;
-            for (const r of rects) {
+            for (const r of rawRects) {
                 const dist = (mousePos.y >= r.top && mousePos.y <= r.bottom) ? 0 :
                              Math.min(Math.abs(mousePos.y - r.top), Math.abs(mousePos.y - r.bottom));
                 if (dist < minDist) {
@@ -300,11 +325,13 @@
                     cursorRect = r;
                 }
             }
-            // Ограничиваем X позицией внутри найденной строки
             cursorX = Math.max(cursorRect.left, Math.min(mousePos.x, cursorRect.right));
-            isCursorAtTop = (cursorRect === rects[0]);
+
+            const overallTop = Math.min(...rawRects.map(r => r.top));
+            const overallBottom = Math.max(...rawRects.map(r => r.bottom));
+            const midY = overallTop + (overallBottom - overallTop) / 2;
+            isCursorAtTop = ((cursorRect.top + cursorRect.bottom) / 2) < midY;
         } else {
-            // Если выделение сделано с клавиатуры, проверяем обратное направление
             let isBackward = false;
             try {
                 if (selection && selection.anchorNode && selection.focusNode) {
@@ -318,11 +345,11 @@
             } catch (e) {}
 
             if (isBackward) {
-                cursorRect = rects[0];
+                cursorRect = rawRects[0];
                 cursorX = cursorRect.left;
                 isCursorAtTop = true;
             } else {
-                cursorRect = rects[rects.length - 1];
+                cursorRect = rawRects[rawRects.length - 1];
                 cursorX = cursorRect.right;
                 isCursorAtTop = false;
             }
@@ -330,8 +357,6 @@
 
         return {
             text,
-            firstRect: rects[0],
-            lastRect: rects[rects.length - 1],
             cursorRect,
             cursorX,
             isCursorAtTop,
@@ -363,10 +388,8 @@
         const scrollX = window.scrollX || window.pageXOffset || 0;
         const scrollY = window.scrollY || window.pageYOffset || 0;
 
-        // Центрируем блок точно по реальному положению курсора
         let left = info.cursorX + scrollX - (tbWidth / 2);
 
-        // Предотвращение выхода за границы экрана
         const padding = 8;
         const maxLeft = scrollX + window.innerWidth - tbWidth - padding;
         const minLeft = scrollX + padding;
@@ -376,21 +399,18 @@
         const offset = 6;
 
         if (info.isMultiLine) {
-            // Если выделяли снизу вверх (курсор на верхней строке) — выводим сверху, чтобы не закрывать текст ниже
             if (info.isCursorAtTop) {
                 top = info.cursorRect.top + scrollY - tbHeight - offset;
                 if (info.cursorRect.top - tbHeight - offset < 0) {
                     top = info.cursorRect.bottom + scrollY + offset;
                 }
             } else {
-                // Если выделяли сверху вниз (курсор на нижней строке) — выводим снизу
                 top = info.cursorRect.bottom + scrollY + offset;
                 if (info.cursorRect.bottom + offset + tbHeight > window.innerHeight) {
                     top = info.cursorRect.top + scrollY - tbHeight - offset;
                 }
             }
         } else {
-            // 1 строка: всегда сверху над строкой у курсора
             top = info.cursorRect.top + scrollY - tbHeight - offset;
             if (info.cursorRect.top - tbHeight - offset < 0) {
                 top = info.cursorRect.bottom + scrollY + offset;
@@ -402,7 +422,6 @@
         toolbar.classList.add('visible');
     }
 
-    // Сохраняем реальную точку отпускания мыши
     document.addEventListener('mouseup', (e) => {
         if (e.composedPath().includes(host) || e.composedPath().includes(toolbar)) {
             return;

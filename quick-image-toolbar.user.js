@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Quick Image Toolbar
 // @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  Миниатюрные иконки «Копировать», «Поиск по картинке в Google» и «Закрыть» для всех форматов изображений (JPG, PNG, WebP, AVIF, SVG, GIF)
+// @version      1.3
+// @description  Миниатюрные иконки «Копировать», «Поиск по картинке в Google» и «Закрыть» для всех форматов изображений с поддержкой оверлеев (Pinterest, соцсети)
 // @author       Antigravity
 // @match        *://*/*
+// @connect      *
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @run-at       document-end
@@ -13,10 +14,10 @@
 (function () {
     'use strict';
 
-    // Создаем изолированный Shadow DOM
+    // Создаем изолированный Shadow DOM с наивысшим приоритетом отображения
     const host = document.createElement('div');
     host.id = 'tm-image-toolbar-host';
-    host.style.all = 'initial';
+    host.style.cssText = 'all: initial !important; position: absolute !important; top: 0 !important; left: 0 !important; z-index: 2147483647 !important; pointer-events: none !important; width: 0 !important; height: 0 !important;';
     document.documentElement.appendChild(host);
 
     const shadow = host.attachShadow({ mode: 'open' });
@@ -25,16 +26,17 @@
     const style = document.createElement('style');
     style.textContent = `
         :host {
-            all: initial;
-            z-index: 2147483647;
-            position: absolute;
-            top: 0;
-            left: 0;
-            pointer-events: none;
+            all: initial !important;
+            z-index: 2147483647 !important;
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            pointer-events: none !important;
         }
 
         .toolbar {
             position: absolute;
+            z-index: 2147483647;
             display: inline-flex;
             align-items: center;
             gap: 2px;
@@ -163,18 +165,11 @@
     let showTimeout = null;
     let hideTimeout = null;
     let copyStatusTimeout = null;
+    let lastMoveTime = 0;
 
     toolbar.addEventListener('mousedown', (e) => {
         e.preventDefault();
         e.stopPropagation();
-    });
-
-    toolbar.addEventListener('mouseenter', () => {
-        clearTimeout(hideTimeout);
-    });
-
-    toolbar.addEventListener('mouseleave', () => {
-        scheduleHide();
     });
 
     function triggerCopySuccess() {
@@ -190,12 +185,11 @@
         }, 150);
     }
 
-    // Универсальное копирование любых форматов (JPG, JPEG, PNG, WebP, AVIF, SVG, GIF, Data URL)
+    // Универсальное копирование любых форматов картинок
     async function copyImageToClipboard(img) {
         const src = img.currentSrc || img.src;
         if (!src) return;
 
-        // Способ 1: Прямой захват через Canvas (самый быстрый, работает для любых форматов если нет CORS)
         try {
             const width = img.naturalWidth || img.width || 300;
             const height = img.naturalHeight || img.height || 300;
@@ -211,18 +205,15 @@
                 return;
             }
         } catch (e) {
-            // Если Canvas заблокирован политикой CORS страницы — используем загрузку через Tampermonkey
+            // CORS заблокировал Canvas — используем GM_xmlhttpRequest
         }
 
-        // Вспомогательная функция обработки загруженного бинарного Blob (любого формата)
         const processBlob = async (blob) => {
             try {
                 let imgSource;
                 try {
-                    // Декодируем JPG, WebP, AVIF, GIF, PNG
                     imgSource = await createImageBitmap(blob);
                 } catch (err) {
-                    // Fallback для векторного SVG или форматов без поддержки createImageBitmap
                     imgSource = await new Promise((resolve, reject) => {
                         const tempImg = new Image();
                         const blobUrl = URL.createObjectURL(blob);
@@ -241,17 +232,14 @@
                 const ctx = canvas.getContext('2d');
                 ctx.drawImage(imgSource, 0, 0);
 
-                // Браузеры помещают изображения в буфер обмена в стандартном формате image/png
                 const pngBlob = await new Promise(r => canvas.toBlob(r, 'image/png'));
                 await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
                 triggerCopySuccess();
             } catch (err) {
-                // Если буфер системы заблокировал бинарные данные — копируем ссылку
                 fallbackCopyText(src);
             }
         };
 
-        // Если это Data URL (base64)
         if (src.startsWith('data:')) {
             try {
                 const res = await fetch(src);
@@ -263,7 +251,6 @@
             return;
         }
 
-        // Способ 2: Загрузка через GM_xmlhttpRequest в обход всех CORS-ограничений сайта
         if (typeof GM_xmlhttpRequest === 'function') {
             GM_xmlhttpRequest({
                 method: 'GET',
@@ -299,7 +286,6 @@
         }
     });
 
-    // Поиск по картинке через Google Lens
     btnSearch.addEventListener('click', (e) => {
         e.stopPropagation();
         if (!currentImg) return;
@@ -314,7 +300,6 @@
         hideToolbar();
     });
 
-    // Кнопка закрытия (×)
     btnClose.addEventListener('click', (e) => {
         e.stopPropagation();
         dismissedImg = currentImg;
@@ -335,13 +320,16 @@
 
     function scheduleHide() {
         clearTimeout(hideTimeout);
-        hideTimeout = setTimeout(hideToolbar, 120);
+        hideTimeout = setTimeout(() => {
+            hideToolbar();
+            currentImg = null;
+            dismissedImg = null;
+        }, 150);
     }
 
     function positionToolbar(img) {
         const rect = img.getBoundingClientRect();
 
-        // Пропускаем слишком мелкие иконки (< 50x50px)
         if (rect.width < 50 || rect.height < 50) {
             hideToolbar();
             return;
@@ -363,32 +351,81 @@
         toolbar.classList.add('visible');
     }
 
-    // Отслеживание наведения на изображения
-    document.addEventListener('mouseover', (e) => {
-        const target = e.target;
-        if (!target || target.tagName !== 'IMG') return;
-
-        if (target === dismissedImg) return;
-
-        currentImg = target;
-        clearTimeout(hideTimeout);
-        clearTimeout(showTimeout);
-
-        showTimeout = setTimeout(() => {
-            if (currentImg === target) {
-                resetCopyButton();
-                positionToolbar(target);
+    // Проверяет, находится ли курсор над картинкой или тулбаром (даже если есть оверлеи)
+    function isMouseOverTarget(x, y) {
+        if (toolbar.classList.contains('visible')) {
+            const tbRect = toolbar.getBoundingClientRect();
+            if (x >= tbRect.left && x <= tbRect.right && y >= tbRect.top && y <= tbRect.bottom) {
+                return true;
             }
-        }, 70);
-    });
-
-    document.addEventListener('mouseout', (e) => {
-        const target = e.target;
-        if (target && target.tagName === 'IMG' && target === currentImg) {
-            dismissedImg = null;
-            scheduleHide();
         }
-    });
+        if (currentImg && document.body.contains(currentImg)) {
+            const imgRect = currentImg.getBoundingClientRect();
+            if (x >= imgRect.left && x <= imgRect.right && y >= imgRect.top && y <= imgRect.bottom) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Ищет реальный тег IMG под курсором в глубину сквозь все наложенные слои и оверлеи Pinterest
+    function findImageAtPoint(x, y) {
+        const elements = document.elementsFromPoint(x, y);
+        for (const el of elements) {
+            if (el === host || toolbar.contains(el) || el.id === 'tm-image-toolbar-host') continue;
+            if (el.tagName === 'IMG') {
+                const rect = el.getBoundingClientRect();
+                if (rect.width >= 50 && rect.height >= 50) {
+                    return el;
+                }
+            }
+        }
+        return null;
+    }
+
+    // Отслеживание перемещения мыши
+    document.addEventListener('mousemove', (e) => {
+        const x = e.clientX;
+        const y = e.clientY;
+
+        // Если курсор всё ещё находится в пределах текущей картинки или тулбара — держим панель открытой
+        if (currentImg && isMouseOverTarget(x, y)) {
+            clearTimeout(hideTimeout);
+            return;
+        }
+
+        // Троттлинг поиска новых картинок
+        const now = Date.now();
+        if (now - lastMoveTime < 40) return;
+        lastMoveTime = now;
+
+        // Ищем картинку под курсором сквозь любые слои Pinterest/сайта
+        const img = findImageAtPoint(x, y);
+
+        if (img) {
+            if (img === dismissedImg) return;
+            if (img === currentImg && toolbar.classList.contains('visible')) {
+                clearTimeout(hideTimeout);
+                return;
+            }
+
+            currentImg = img;
+            clearTimeout(hideTimeout);
+            clearTimeout(showTimeout);
+
+            showTimeout = setTimeout(() => {
+                if (currentImg === img && isMouseOverTarget(x, y)) {
+                    resetCopyButton();
+                    positionToolbar(img);
+                }
+            }, 70);
+        } else {
+            // Если курсор вышел за пределы картинок и тулбара
+            if (currentImg) {
+                scheduleHide();
+            }
+        }
+    }, { passive: true });
 
     // Обновление позиции при скролле
     window.addEventListener('scroll', () => {
